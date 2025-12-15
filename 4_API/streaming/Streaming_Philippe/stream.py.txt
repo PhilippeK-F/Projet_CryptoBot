@@ -1,0 +1,142 @@
+import os
+import json
+import asyncio
+import logging
+from datetime import datetime, timezone
+
+import websockets
+from pymongo import MongoClient, ASCENDING
+from pymongo.errors import PyMongoError
+from dotenv import load_dotenv
+
+load_dotenv()
+
+BINANCE_WS_BASE = "wss://stream.binance.com:9443/stream"
+
+SYMBOLS = os.getenv("SYMBOLS", "BTCUSDT,ETHUSDT").split(",")
+INTERVALS = os.getenv("INTERVALS", "15m").split(",")
+
+MONGO_HOST = os.getenv("MONGO_HOST", "mongo")
+MONGO_PORT = int(os.getenv("MONGO_PORT", "27017"))
+MONGO_DB = os.getenv("MONGO_DB", "crypto_streaming")
+MONGO_COLLECTION = os.getenv("MONGO_COLLECTION", "klines_stream")
+
+RECONNECT_DELAY = int(os.getenv("RECONNECT_DELAY", "5"))
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
+
+
+def get_mongo_collection():
+    client = MongoClient(host=MONGO_HOST, port=MONGO_PORT)
+    db = client[MONGO_DB]
+    collection = db[MONGO_COLLECTION]
+
+    collection.create_index(
+        [("symbol", ASCENDING), ("interval", ASCENDING), ("open_time", ASCENDING)],
+        unique=True,
+    )
+
+    return collection
+
+
+def build_streams():
+    streams = []
+    for symbol in SYMBOLS:
+        for interval in INTERVALS:
+            streams.append(f"{symbol.lower()}@kline_{interval}")
+    return "/".join(streams)
+
+
+def parse_kline_message(message: dict):
+    data = message.get("data", {})
+    k = data.get("k", {})
+
+    if not k:
+        return None
+
+    try:
+        open_time = datetime.fromtimestamp(k["t"] / 1000, tz=timezone.utc)
+        close_time = datetime.fromtimestamp(k["T"] / 1000, tz=timezone.utc)
+
+        return {
+            "symbol": k["s"],
+            "interval": k["i"],
+            "open_time": open_time,
+            "close_time": close_time,
+            "open": float(k["o"]),
+            "high": float(k["h"]),
+            "low": float(k["l"]),
+            "close": float(k["c"]),
+            "volume": float(k["v"]),
+            "closed": bool(k["x"]),
+            "event_time": datetime.fromtimestamp(data.get("E", 0) / 1000, tz=timezone.utc),
+            "raw": k,
+        }
+
+    except Exception as e:
+        logging.warning(f"Erreur parsing message: {e}")
+        return None
+
+
+async def stream_klines():
+    collection = get_mongo_collection()
+    streams = build_streams()
+
+    ws_url = f"{BINANCE_WS_BASE}?streams={streams}"
+
+    logging.info(f"Connexion WebSocket: {ws_url}")
+    logging.info(f"Symbols: {SYMBOLS} | Intervals: {INTERVALS}")
+
+    while True:
+        try:
+            async with websockets.connect(ws_url, ping_interval=20, ping_timeout=20) as websocket:
+                logging.info("Connexion établie.")
+
+                async for msg in websocket:
+                    try:
+                        data = json.loads(msg)
+                    except json.JSONDecodeError:
+                        logging.warning("Message non JSON reçu.")
+                        continue
+
+                    doc = parse_kline_message(data)
+                    if not doc:
+                        continue
+
+                    try:
+                        collection.update_one(
+                            {
+                                "symbol": doc["symbol"],
+                                "interval": doc["interval"],
+                                "open_time": doc["open_time"],
+                            },
+                            {"$set": doc},
+                            upsert=True,
+                        )
+
+                        if doc["closed"]:
+                            logging.info(
+                                f"Bougie clôturée {doc['symbol']} {doc['interval']} close={doc['close']}"
+                            )
+
+                    except PyMongoError as e:
+                        logging.error(f"Erreur MongoDB: {e}")
+
+        except Exception as e:
+            logging.error(f"Erreur WebSocket: {e}")
+            logging.info(f"Reconnexion dans {RECONNECT_DELAY} secondes.")
+            await asyncio.sleep(RECONNECT_DELAY)
+
+
+def main():
+    try:
+        asyncio.run(stream_klines())
+    except KeyboardInterrupt:
+        logging.info("Arrêt demandé.")
+
+
+if __name__ == "__main__":
+    main()
